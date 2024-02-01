@@ -1,5 +1,17 @@
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index adba49afb5fe..7eae3ca2780c 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -1581,6 +1581,7 @@ EXPORT_SYMBOL_GPL(kvm_cpuid);
+ 
+ int kvm_emulate_cpuid(struct kvm_vcpu *vcpu)
+ {
++	vcpu.run->exit_reason = 123;
+ 	u32 eax, ebx, ecx, edx;
+ 
+ 	if (cpuid_fault_enabled(vcpu) && !kvm_require_cpl(vcpu, 0))
 diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
-index e90b429c84f1..f2f4d9260522 100644
+index e90b429c84f1..1a8ecec67d35 100644
 --- a/arch/x86/kvm/svm/svm.c
 +++ b/arch/x86/kvm/svm/svm.c
 @@ -1283,6 +1283,7 @@ static void init_vmcb(struct kvm_vcpu *vcpu)
@@ -19,7 +31,7 @@ index e90b429c84f1..f2f4d9260522 100644
 +	static u64 rdtsc_prev = 0;
 +	u64 rdtsc_real = rdtsc();
 +
-+	printk_once(KERN_INFO "[SVM Fake RDTSC]: Real: %llu Fake: %llu Prev: %llu\n", rdtsc_real, rdtsc_fake, rdtsc_prev);
++	printk_once(KERN_INFO "[SVM Fake RDTSC]: %llu\n", rdtsc_real);
 +
 +	if (rdtsc_prev != 0) {
 +		if (rdtsc_real > rdtsc_prev) {
@@ -51,3 +63,101 @@ index e90b429c84f1..f2f4d9260522 100644
  };
  
  static void dump_vmcb(struct kvm_vcpu *vcpu)
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 363b1c080205..bf07de1c5117 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2109,6 +2109,7 @@ int kvm_emulate_as_nop(struct kvm_vcpu *vcpu)
+ 
+ int kvm_emulate_invd(struct kvm_vcpu *vcpu)
+ {
++	vcpu.run->exit_reason = 123;
+ 	/* Treat an INVD instruction as a NOP and just skip it. */
+ 	return kvm_emulate_as_nop(vcpu);
+ }
+@@ -4248,16 +4249,12 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		 * behavior for migration.
+ 		 */
+ 		u64 offset, ratio;
++		differece = rdtsc() - vcpu->last_exit_start;
++		final_time = vcpu->total_exit_time + differece;
+ 
+-		if (msr_info->host_initiated) {
+-			offset = vcpu->arch.l1_tsc_offset;
+-			ratio = vcpu->arch.l1_tsc_scaling_ratio;
+-		} else {
+-			offset = vcpu->arch.tsc_offset;
+-			ratio = vcpu->arch.tsc_scaling_ratio;
+-		}
++		msr_info->data = rdtsc() - final_time;
+ 
+-		msr_info->data = kvm_scale_tsc(rdtsc(), ratio) + offset;
++		vcpu->run->exit_reason = 123;
+ 		break;
+ 	}
+ 	case MSR_IA32_CR_PAT:
+@@ -8152,6 +8149,7 @@ static int kvm_emulate_wbinvd_noskip(struct kvm_vcpu *vcpu)
+ 
+ int kvm_emulate_wbinvd(struct kvm_vcpu *vcpu)
+ {
++	vcpu.run->exit_reason = 123;
+ 	kvm_emulate_wbinvd_noskip(vcpu);
+ 	return kvm_skip_emulated_instruction(vcpu);
+ }
+@@ -10685,7 +10683,7 @@ EXPORT_SYMBOL_GPL(__kvm_request_immediate_exit);
+  * exiting to the userspace.  Otherwise, the value will be returned to the
+  * userspace.
+  */
+-static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
++static int vcpu_enter_guest_real(struct kvm_vcpu *vcpu)
+ {
+ 	int r;
+ 	bool req_int_win =
+@@ -11074,6 +11072,24 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	return r;
+ }
+ 
++static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
++{
++	int result;
++	u64 differece;
++
++	vcpu->last_exit_start = rdtsc();
++
++	result = vcpu_enter_guest_real(vcpu);
++
++	if (vcpu->run->exit_reason == 123)
++	{
++		differece = rdtsc() - vcpu->last_exit_start;
++		vcpu->total_exit_time += differece;
++	}
++
++	return result;
++}
++
+ /* Called within kvm->srcu read side.  */
+ static inline int vcpu_block(struct kvm_vcpu *vcpu)
+ {
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 7e7fd25b09b3..7408f126a935 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -347,6 +347,9 @@ struct kvm_vcpu {
+ 	sigset_t sigset;
+ 	unsigned int halt_poll_ns;
+ 	bool valid_wakeup;
++	u64 last_exit_start;
++	u64 total_exit_time;
++
+ 
+ #ifdef CONFIG_HAS_IOMEM
+ 	int mmio_needed;
+@@ -1322,7 +1325,7 @@ void kvm_vcpu_mark_page_dirty(struct kvm_vcpu *vcpu, gfn_t gfn);
+  * @vcpu:	   vCPU to be used for marking pages dirty and to be woken on
+  *		   invalidation.
+  * @usage:	   indicates if the resulting host physical PFN is used while
+- *		   the @vcpu is IN_GUEST_MODE (in which case invalidation of 
++ *		   the @vcpu is IN_GUEST_MODE (in which case invalidation of
+  *		   the cache from MMU notifiers---but not for KVM memslot
+  *		   changes!---will also force @vcpu to exit the guest and
+  *		   refresh the cache); and/or if the PFN used directly
